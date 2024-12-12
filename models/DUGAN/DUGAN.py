@@ -6,14 +6,16 @@ import torchvision
 import argparse
 import tqdm
 import torch.nn as nn
-
+import os
 from models.basic_template import TrainTask
 from utils.grad_loss import SobelOperator
 from .DUGAN_wrapper import UNet
 from models.REDCNN.REDCNN_wrapper import Generator
 from utils.gan_loss import ls_gan
 from utils.ops import turn_on_spectral_norm
-from utils.metrics import compute_ssim, compute_psnr, compute_rmse
+from utils.metrics import compute_ssim, compute_psnr, compute_rmse, compute_measure
+import matplotlib.pyplot as plt
+
 
 '''
 python main.py --batch_size=64 --cr_loss_weight=5.08720932695335 --cutmix_prob=0.7615524094697519 --cutmix_warmup_iter=1000 --d_lr=7.122979672016055e-05 --g_lr=0.00018083340390609657 --grad_gen_loss_weight=0.11960717521104237 --grad_loss_weight=35.310016043755894 --img_gen_loss_weight=0.14178356036938378 --max_iter=50000 --model_name=UnetGAN --num_channels=32 --num_layers=10 --num_workers=32 --pix_loss_weight=5.034293425614828 --print_freq=10 --run_name=newest --save_freq=2500 --test_batch_size=8 --test_dataset_name=lmayo_test_512 --train_dataset_name=lmayo_train_64 --use_grad_discriminator=true --weight_decay 0. --num_workers 4
@@ -212,6 +214,65 @@ class DUGAN(TrainTask):
 
     @torch.no_grad()
     def test(self, n_iter):
+
+        opt = self.opt
+        self.generator.eval()
+        self.ema_generator.eval()
+        print(f"Testing model at epoch {opt.resume_iter}")
+        # compute PSNR, SSIM, RMSE
+        
+
+        for name, generator in zip(['ema_', ''], [self.ema_generator, self.generator]):
+            ori_psnr_avg, ori_ssim_avg, ori_rmse_avg = 0, 0, 0
+            pred_psnr_avg, pred_ssim_avg, pred_rmse_avg = 0, 0, 0
+
+            psnr_score, ssim_score, rmse_score, total_num = 0., 0., 0., 0
+            print(f"------------ Testing with loader {self.test_loader}")
+            for i, data in tqdm.tqdm(enumerate(self.test_loader, 0), desc=name, total=len(self.test_loader)):
+                input_ = data[0].cuda()
+                target = data[1].cuda()
+
+                restored = generator(target).clamp(0., 1.)
+                
+                H, W = input_.shape[-2], input_.shape[-1]
+                x = trunc(self, denormalize_(self, input_.view(H, W).cpu().detach()))
+                y = trunc(self, denormalize_(self, target.view(H, W).cpu().detach()))
+                pred = trunc(self, denormalize_(self, restored.view(H,W).cpu().detach()))
+                data_range = opt.trunc_max - opt.trunc_min
+                original_result, pred_result = compute_measure(x, y, pred,data_range)
+
+                ori_psnr_avg += original_result[0]
+                ori_ssim_avg += original_result[1]
+                ori_rmse_avg += original_result[2]
+                pred_psnr_avg += pred_result[0]
+                pred_ssim_avg += pred_result[1]
+                pred_rmse_avg += pred_result[2]
+
+                if opt.save_images:
+                     save_fig(self, x, y, pred, str(name)+str(i), original_result, pred_result)
+                #print(f"Test iteration {i}")
+            
+            print('\n')
+            print('Original === \nPSNR avg: {:.4f} \nSSIM avg: {:.4f} \nRMSE avg: {:.4f}'.format(ori_psnr_avg/len(self.test_loader), 
+                                                                                            ori_ssim_avg/len(self.test_loader), 
+                                                                                            ori_rmse_avg/len(self.test_loader)))
+            print('\n')
+            print('Predictions === \nPSNR avg: {:.4f} \nSSIM avg: {:.4f} \nRMSE avg: {:.4f}'.format(pred_psnr_avg/len(self.test_loader), 
+                                                                                                  pred_ssim_avg/len(self.test_loader), 
+                                                                                                  pred_rmse_avg/len(self.test_loader)))
+
+
+            #psnr = psnr_score / total_num
+            #ssim = ssim_score / total_num
+            #rmse = rmse_score / total_num
+            
+
+            #self.logger.msg({'{}ssim'.format(name): ssim,
+            #                 '{}psnr'.format(name): psnr,
+            #                 '{}rmse'.format(name): rmse}, n_iter)
+'''
+    @torch.no_grad()
+    def test(self, n_iter):
         self.generator.eval()
         self.ema_generator.eval()
         for name, generator in zip(['ema_', ''], [self.ema_generator, self.generator]):
@@ -231,6 +292,9 @@ class DUGAN(TrainTask):
             self.logger.msg({'{}ssim'.format(name): ssim,
                              '{}psnr'.format(name): psnr,
                              '{}rmse'.format(name): rmse}, n_iter)
+'''
+
+           
 
 
 def warmup(warmup_iter, cutmix_prob, n_iter):
@@ -253,5 +317,39 @@ def cutmix(mask_size):
     return mask
 
 
+#cristina
 def mask_src_tgt(source, target, mask):
     return source * mask + (1 - mask) * target
+
+
+def save_fig(self, x, y, pred, fig_name, original_result, pred_result):
+        opt = self.opt
+        x, y, pred = x.numpy(), y.numpy(), pred.numpy()
+        f, ax = plt.subplots(1, 3, figsize=(30, 10))
+        ax[0].imshow(x, cmap=plt.cm.gray, vmin=opt.trunc_min, vmax=opt.trunc_max)
+        ax[0].set_title('Quarter-dose', fontsize=30)
+        ax[0].set_xlabel("PSNR: {:.4f}\nSSIM: {:.4f}\nRMSE: {:.4f}".format(original_result[0],
+                                                                           original_result[1],
+                                                                           original_result[2]), fontsize=20)
+        ax[1].imshow(pred, cmap=plt.cm.gray, vmin=opt.trunc_min, vmax=opt.trunc_max)
+        ax[1].set_title('Result', fontsize=30)
+        ax[1].set_xlabel("PSNR: {:.4f}\nSSIM: {:.4f}\nRMSE: {:.4f}".format(pred_result[0],
+                                                                           pred_result[1],
+                                                                           pred_result[2]), fontsize=20)
+        ax[2].imshow(y, cmap=plt.cm.gray, vmin=opt.trunc_min, vmax=opt.trunc_max)
+        ax[2].set_title('Full-dose', fontsize=30)
+
+
+        f.savefig(os.path.join(opt.save_img_dir, 'result_{}.png'.format(fig_name)))
+        plt.close()
+
+def trunc(self, mat):
+        opt = self.opt
+        mat[mat <= opt.trunc_min] = opt.trunc_min
+        mat[mat >= opt.trunc_max] = opt.trunc_max
+        return mat
+
+def denormalize_(self, image):
+        opt = self.opt
+        image = image * (opt.norm_range_max - opt.norm_range_min) + opt.norm_range_min
+        return image
