@@ -7,6 +7,8 @@ import argparse
 import tqdm
 import torch.nn as nn
 import os
+import pandas as pd
+
 from models.basic_template import TrainTask
 from utils.grad_loss import SobelOperator
 from .DUGAN_wrapper import UNet
@@ -218,13 +220,23 @@ class DUGAN(TrainTask):
         opt = self.opt
         self.generator.eval()
         self.ema_generator.eval()
+
+        self.data_loader = self.test_loader
         print(f"Testing model at epoch {opt.resume_iter}")
         # compute PSNR, SSIM, RMSE
+        # Create directory for saving predictions
+        predictions_dir = os.path.join(opt.save_pred_dir, 'DUGAN'+'_i'+str(opt.resume_iter)+'_n'+str(opt.noise_level))
+        pred_dir_path = os.path.join(predictions_dir, 'npy')
+        os.makedirs(pred_dir_path, exist_ok=True)
         
 
         for name, generator in zip(['ema_', ''], [self.ema_generator, self.generator]):
             ori_psnr_avg, ori_ssim_avg, ori_rmse_avg = 0, 0, 0
             pred_psnr_avg, pred_ssim_avg, pred_rmse_avg = 0, 0, 0
+            ori_psnr_list, ori_ssim_list, ori_rmse_list = [], [], []
+            pred_psnr_list, pred_ssim_list, pred_rmse_list = [], [], []
+            #here loss
+            test_losses = []  # List to store test losses
 
             psnr_score, ssim_score, rmse_score, total_num = 0., 0., 0., 0
             print(f"------------ Testing with loader {self.test_loader}")
@@ -232,12 +244,19 @@ class DUGAN(TrainTask):
                 input_ = data[0].cuda()
                 target = data[1].cuda()
 
-                restored = generator(target).clamp(0., 1.)
+                restored = generator(input_).clamp(0., 1.)
                 
                 H, W = input_.shape[-2], input_.shape[-1]
                 x = trunc(self, denormalize_(self, input_.view(H, W).cpu().detach()))
                 y = trunc(self, denormalize_(self, target.view(H, W).cpu().detach()))
                 pred = trunc(self, denormalize_(self, restored.view(H,W).cpu().detach()))
+
+                # Save predictions
+                
+                os.makedirs(pred_dir_path, exist_ok=True)
+                pred_file_path = os.path.join(pred_dir_path, f'prediction_{i:04d}.npy')
+                np.save(pred_file_path, pred.numpy())
+
                 data_range = opt.trunc_max - opt.trunc_min
                 original_result, pred_result = compute_measure(x, y, pred,data_range)
 
@@ -248,28 +267,64 @@ class DUGAN(TrainTask):
                 pred_ssim_avg += pred_result[1]
                 pred_rmse_avg += pred_result[2]
 
+                # Append results to lists
+                ori_psnr_list.append(original_result[0])
+                ori_ssim_list.append(original_result[1])
+                ori_rmse_list.append(original_result[2])
+                pred_psnr_list.append(pred_result[0])
+                pred_ssim_list.append(pred_result[1])
+                pred_rmse_list.append(pred_result[2])
+
+
+
                 if opt.save_images:
-                     save_fig(self, x, y, pred, str(name)+str(i), original_result, pred_result)
+                     save_fig(self, x, y, pred, str(name)+str(i), original_result, pred_result, predictions_dir)
                 #print(f"Test iteration {i}")
             
             print('\n')
-            print('Original === \nPSNR avg: {:.4f} \nSSIM avg: {:.4f} \nRMSE avg: {:.4f}'.format(ori_psnr_avg/len(self.test_loader), 
-                                                                                            ori_ssim_avg/len(self.test_loader), 
-                                                                                            ori_rmse_avg/len(self.test_loader)))
+            print('Original === \nPSNR avg: {:.4f} \nSSIM avg: {:.4f} \nRMSE avg: {:.4f}'.format(ori_psnr_avg/len(self.data_loader), 
+                                                                                            ori_ssim_avg/len(self.data_loader), 
+                                                                                            ori_rmse_avg/len(self.data_loader)))
             print('\n')
-            print('Predictions === \nPSNR avg: {:.4f} \nSSIM avg: {:.4f} \nRMSE avg: {:.4f}'.format(pred_psnr_avg/len(self.test_loader), 
-                                                                                                  pred_ssim_avg/len(self.test_loader), 
-                                                                                                  pred_rmse_avg/len(self.test_loader)))
+            print('Predictions === \nPSNR avg: {:.4f} \nSSIM avg: {:.4f} \nRMSE avg: {:.4f}'.format(pred_psnr_avg/len(self.data_loader), 
+                                                                                                  pred_ssim_avg/len(self.data_loader), 
+                                                                                                  pred_rmse_avg/len(self.data_loader)))
 
+    # Create a DataFrame to save the results
+        sample_results  = {
+        'Index': list(range(len(self.data_loader))),
+        'Original_PSNR': ori_psnr_list,
+        'Original_SSIM': ori_ssim_list,
+        'Original_RMSE': ori_rmse_list,
+        'Prediction_PSNR': pred_psnr_list,
+        'Prediction_SSIM': pred_ssim_list,
+        'Prediction_RMSE': pred_rmse_list
+        }
+        df_samples = pd.DataFrame(sample_results)
 
-            #psnr = psnr_score / total_num
-            #ssim = ssim_score / total_num
-            #rmse = rmse_score / total_num
+        # DataFrame for averages
+        avg_results = {
+            'Metric': ['PSNR', 'SSIM', 'RMSE'],
+            'Original_Avg': [ori_psnr_avg/len(self.data_loader), ori_ssim_avg/len(self.data_loader), ori_rmse_avg/len(self.data_loader)],
+            'Prediction_Avg': [pred_psnr_avg/len(self.data_loader), pred_ssim_avg/len(self.data_loader), pred_rmse_avg/len(self.data_loader)]
+        }
+        df_averages = pd.DataFrame(avg_results)
+
+        # Save both DataFrames to separate CSV files or combine them if needed
+        result_samples_path = os.path.join(predictions_dir, 'measurement_sample_results.csv')
+        result_averages_path = os.path.join(predictions_dir, 'measurement_avg_results.csv')
+
+        df_samples.to_csv(result_samples_path, index=False)
+        df_averages.to_csv(result_averages_path, index=False)
+
+        print(f"Sample results saved to {result_samples_path}")
+        print(f"Average results saved to {result_averages_path}")
+
+        # Save test losses
+        loss_file_path = os.path.join(predictions_dir, 'test_losses.npy')
+        np.save(loss_file_path, np.array(test_losses))
+        print(f"Test losses saved to {loss_file_path}")
             
-
-            #self.logger.msg({'{}ssim'.format(name): ssim,
-            #                 '{}psnr'.format(name): psnr,
-            #                 '{}rmse'.format(name): rmse}, n_iter)
 '''
     @torch.no_grad()
     def test(self, n_iter):
@@ -322,12 +377,12 @@ def mask_src_tgt(source, target, mask):
     return source * mask + (1 - mask) * target
 
 
-def save_fig(self, x, y, pred, fig_name, original_result, pred_result):
+def save_fig(self, x, y, pred, fig_name, original_result, pred_result, save_path):
         opt = self.opt
         x, y, pred = x.numpy(), y.numpy(), pred.numpy()
         f, ax = plt.subplots(1, 3, figsize=(30, 10))
         ax[0].imshow(x, cmap=plt.cm.gray, vmin=opt.trunc_min, vmax=opt.trunc_max)
-        ax[0].set_title('Quarter-dose', fontsize=30)
+        ax[0].set_title(f'Low dose {opt.noise_level}', fontsize=30)
         ax[0].set_xlabel("PSNR: {:.4f}\nSSIM: {:.4f}\nRMSE: {:.4f}".format(original_result[0],
                                                                            original_result[1],
                                                                            original_result[2]), fontsize=20)
@@ -338,9 +393,9 @@ def save_fig(self, x, y, pred, fig_name, original_result, pred_result):
                                                                            pred_result[2]), fontsize=20)
         ax[2].imshow(y, cmap=plt.cm.gray, vmin=opt.trunc_min, vmax=opt.trunc_max)
         ax[2].set_title('Full-dose', fontsize=30)
-
-
-        f.savefig(os.path.join(opt.save_img_dir, 'result_{}.png'.format(fig_name)))
+        save_fig_path = os.path.join(save_path, 'fig')
+        os.makedirs(save_fig_path, exist_ok=True)
+        f.savefig(os.path.join(save_fig_path, 'result_{}.png'.format(fig_name)))
         plt.close()
 
 def trunc(self, mat):

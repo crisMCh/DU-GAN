@@ -1,2 +1,9 @@
 .DS_Store
 .idea
+utils/__pycache__/
+*/__pycache__/
+*/*/__pycache__/
+dataset/
+output/DUGAN_default/
+
+
